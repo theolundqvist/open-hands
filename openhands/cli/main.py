@@ -8,6 +8,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.shortcuts import clear
 
 import openhands.agenthub  # noqa F401 (we import this to get the agents registered)
+import openhands.cli.suppress_warnings  # noqa: F401
 from openhands.cli.commands import (
     check_folder_security_agreement,
     handle_commands,
@@ -76,7 +77,6 @@ async def cleanup_session(
     controller: AgentController,
 ) -> None:
     """Clean up all resources from the current session."""
-
     event_stream = runtime.event_stream
     end_state = controller.get_state()
     end_state.save_to_session(
@@ -120,6 +120,7 @@ async def run_session(
     sid = generate_sid(config, session_name)
     is_loaded = asyncio.Event()
     is_paused = asyncio.Event()  # Event to track agent pause requests
+    pause_task: asyncio.Task | None = None  # No more than one pause task
     always_confirm_mode = False  # Flag to enable always confirm mode
 
     # Show runtime initialization message
@@ -154,7 +155,7 @@ async def run_session(
         nonlocal reload_microagents, new_session_requested
         while True:
             next_message = await read_prompt_input(
-                agent_state, multiline=config.cli_multiline_input
+                config, agent_state, multiline=config.cli_multiline_input
             )
 
             if not next_message.strip():
@@ -213,7 +214,7 @@ async def run_session(
                     )
                     return
 
-                confirmation_status = await read_confirmation_input()
+                confirmation_status = await read_confirmation_input(config)
                 if confirmation_status == 'yes' or confirmation_status == 'always':
                     event_stream.add_event(
                         ChangeAgentStateAction(AgentState.USER_CONFIRMED),
@@ -235,9 +236,11 @@ async def run_session(
 
             if event.agent_state == AgentState.RUNNING:
                 display_agent_running_message()
-                loop.create_task(
-                    process_agent_pause(is_paused, event_stream)
-                )  # Create a task to track agent pause requests from the user
+                nonlocal pause_task
+                if pause_task is None or pause_task.done():
+                    pause_task = loop.create_task(
+                        process_agent_pause(is_paused, event_stream)
+                    )  # Create a task to track agent pause requests from the user
 
     def on_event(event: Event) -> None:
         loop.create_task(on_event_async(event))
@@ -273,9 +276,9 @@ async def run_session(
             )
         )
 
-        config.mcp.stdio_servers.extend(openhands_mcp_stdio_servers)
+        runtime.config.mcp.stdio_servers.extend(openhands_mcp_stdio_servers)
 
-        await add_mcp_tools_to_agent(agent, runtime, memory, config)
+        await add_mcp_tools_to_agent(agent, runtime, memory)
 
     # Clear loading animation
     is_loaded.set()
@@ -433,7 +436,23 @@ async def main_with_loop(loop: asyncio.AbstractEventLoop) -> None:
         return
 
     # Read task from file, CLI args, or stdin
-    task_str = read_task(args, config.cli_multiline_input)
+    if args.file:
+        # For CLI usage, we want to enhance the file content with a prompt
+        # that instructs the agent to read and understand the file first
+        with open(args.file, 'r', encoding='utf-8') as file:
+            file_content = file.read()
+
+        # Create a prompt that instructs the agent to read and understand the file first
+        task_str = f"""The user has tagged a file '{args.file}'.
+Please read and understand the following file content first:
+
+```
+{file_content}
+```
+
+After reviewing the file, please ask the user what they would like to do with it."""
+    else:
+        task_str = read_task(args, config.cli_multiline_input)
 
     # Run the first session
     new_session_requested = await run_session(
